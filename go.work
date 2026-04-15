@@ -1,0 +1,8 @@
+go 1.25.1
+
+use (
+	.
+	./examples/webrtc-hl
+	./examples/webrtc-cs-i386
+	./examples/i386
+)

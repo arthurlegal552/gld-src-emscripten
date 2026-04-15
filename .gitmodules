@@ -1,0 +1,4 @@
+[submodule "xash3d-fwgs"]
+	path = xash3d-fwgs
+	url = https://github.com/yohimik/xash3d-fwgs
+	branch = merged

@@ -1,0 +1,13 @@
+.gitignore
+.gitmodules
+# Ignore all Dockerfiles (case-insensitive)
+**/[Dd]ockerfile*
+**/*[Dd]ockerfile*
+
+# Ignore common docker-compose filenames
+docker-compose.yml
+docker-compose.yaml
+**/docker-compose.yml
+**/docker-compose.yaml
+
+*.md
