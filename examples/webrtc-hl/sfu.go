@@ -14,6 +14,8 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,7 +64,24 @@ var connections = make([]io.Writer, 256)
 
 var (
 	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool {
+			allowedOrigins := os.Getenv("ALLOWED_ORIGINS")
+			if allowedOrigins == "" || allowedOrigins == "*" {
+				return true
+			}
+
+			origin := r.Header.Get("Origin")
+			for _, o := range strings.Split(allowedOrigins, ",") {
+				if strings.TrimSpace(o) == origin {
+					return true
+				}
+			}
+			sfuLog.Warnf("Origin blocked: %s", origin)
+			return false
+		},
+		HandshakeTimeout: 10 * time.Second,
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
 	}
 
 	api *webrtc.API
@@ -71,6 +90,13 @@ var (
 	listLock        sync.RWMutex
 	peerConnections []peerConnectionState
 	trackLocals     map[string]*webrtc.TrackLocalStaticRTP
+
+	maxConnections = func() int {
+		if m, err := strconv.Atoi(os.Getenv("MAX_CONNECTIONS")); err == nil && m > 0 {
+			return m
+		}
+		return 32
+	}()
 
 	sfuLog = logging.NewDefaultLoggerFactory().NewLogger("sfu-ws")
 )
@@ -262,6 +288,18 @@ func ReadLoop(d io.Reader, ip [4]byte) {
 
 // Handle incoming websockets.
 func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
+	listLock.RLock()
+	currentConnections := len(peerConnections)
+	listLock.RUnlock()
+
+	if currentConnections >= maxConnections {
+		sfuLog.Warnf("Connection rejected: max connections reached (%d/%d)", currentConnections, maxConnections)
+		http.Error(w, "Server is full", http.StatusServiceUnavailable)
+		return
+	}
+
+	sfuLog.Infof("New connection from %s (%d/%d active)", r.RemoteAddr, currentConnections+1, maxConnections)
+
 	// Upgrade HTTP request to Websocket
 	unsafeConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -269,34 +307,46 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 		return
 	}
 
-	sfuLog.Infof("WebSocket client connected")
-
 	c := &threadSafeWriter{unsafeConn, sync.Mutex{}} // nolint
 
 	// When this frame returns close the Websocket
 	defer c.Close() //nolint
 
 	// Create new PeerConnection
+	stunServer := os.Getenv("STUN_SERVER")
+	if stunServer == "" {
+		stunServer = "stun:stun.l.google.com:19302"
+	}
+
+	iceServers := []webrtc.ICEServer{
+		{
+			URLs: []string{stunServer},
+		},
+	}
+
+	// Adiciona servidor TURN se configurado
+	if turnURL := os.Getenv("TURN_SERVER"); turnURL != "" {
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:       []string{turnURL},
+			Username:   os.Getenv("TURN_USERNAME"),
+			Credential: os.Getenv("TURN_PASSWORD"),
+		})
+	} else {
+		// Fallback para servidor público apenas se não houver TURN próprio
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:       []string{"turn:openrelay.metered.ca:80"},
+			Username:   "openrelayproject",
+			Credential: "openrelayproject",
+		})
+	}
+
 	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{
-	ICEServers: []webrtc.ICEServer{
-	{
-		URLs: []string{
-			"stun:stun.l.google.com:19302",
-		},
-	},
-	{
-		URLs: []string{
-			"turn:openrelay.metered.ca:80",
-		},
-		Username:   "openrelayproject",
-		Credential: "openrelayproject",
-	},
-},
-})
-if err != nil {
-	sfuLog.Errorf("Failed to creates a PeerConnection: %v", err)
-	return
-}
+		ICEServers: iceServers,
+	})
+	if err != nil {
+		sfuLog.Errorf("Failed to creates a PeerConnection: %v", err)
+		return
+	}
 
 	// When this frame returns close the PeerConnection
 	defer peerConnection.Close() //nolint
@@ -381,26 +431,26 @@ if err != nil {
 	defer writeChannel.Close()
 
 	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
-	if i == nil {
-		sfuLog.Infof("SERVER ICE gathering finished")
-		return
-	}
+		if i == nil {
+			sfuLog.Infof("SERVER ICE gathering finished")
+			return
+		}
 
-	sfuLog.Infof("SERVER ICE candidate: %v", i.ToJSON())
+		sfuLog.Infof("SERVER ICE candidate: %v", i.ToJSON())
 
-	candidateString, err := json.Marshal(i.ToJSON())
-	if err != nil {
-		sfuLog.Errorf("Failed to marshal candidate to json: %v", err)
-		return
-	}
+		candidateString, err := json.Marshal(i.ToJSON())
+		if err != nil {
+			sfuLog.Errorf("Failed to marshal candidate to json: %v", err)
+			return
+		}
 
-	if writeErr := c.WriteJSON(&websocketMessage{
-		Event: "candidate",
-		Data:  string(candidateString),
-	}); writeErr != nil {
-		sfuLog.Errorf("Failed to write JSON: %v", writeErr)
-	}
-})
+		if writeErr := c.WriteJSON(&websocketMessage{
+			Event: "candidate",
+			Data:  string(candidateString),
+		}); writeErr != nil {
+			sfuLog.Errorf("Failed to write JSON: %v", writeErr)
+		}
+	})
 
 	// If PeerConnection is closed remove it from global list
 	peerConnection.OnConnectionStateChange(func(p webrtc.PeerConnectionState) {
@@ -550,14 +600,30 @@ func runSFU() {
 	// Init other state
 	trackLocals = map[string]*webrtc.TrackLocalStaticRTP{}
 
+	// Middleware CORS
+	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			next(w, r)
+		}
+	}
+
 	// Rota raiz para health check do Render
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("server online"))
-	})
+	}))
 
 	// websocket handler
-	http.HandleFunc("/websocket", websocketHandler)
+	http.HandleFunc("/websocket", corsMiddleware(websocketHandler))
 
 	// request a keyframe every 3 seconds
 	go func() {
@@ -570,6 +636,3 @@ func runSFU() {
 		sfuLog.Errorf("Failed to start http server: %v", err)
 	}
 }
-
-
-

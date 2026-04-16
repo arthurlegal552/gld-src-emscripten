@@ -1,0 +1,38 @@
+# Caddyfile - Proxy Reverso com TLS Automático para WebXash
+# Substitua pelo seu domínio real
+seu-dominio.com {
+	# Habilita compressão
+	encode gzip zstd
+
+	# Health check
+	handle / {
+		reverse_proxy http://localhost:27016
+	}
+
+	# WebSocket e WebRTC
+	handle /websocket {
+		@websocket {
+			header Connection *Upgrade*
+			header Upgrade websocket
+		}
+		reverse_proxy @websocket http://localhost:27016 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-For {remote_host}
+
+			# Timeouts WebSocket
+			transport http {
+				read_timeout 120s
+				write_timeout 120s
+				idle_timeout 300s
+			}
+		}
+	}
+
+	# Logs
+	log {
+		output file /var/log/caddy/webxash.log
+		format console
+	}
+}

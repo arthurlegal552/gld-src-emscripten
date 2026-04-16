@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  webxash-server:
+    build:
+      context: ../../
+      dockerfile: examples/webrtc-hl/Dockerfile
+    restart: unless-stopped
+    environment:
+      - PORT=27016
+      - MAX_CONNECTIONS=16
+      - ALLOWED_ORIGINS=https://seu-cliente.netlify.app,https://seu-dominio.com
+      - STUN_SERVER=stun:stun.l.google.com:19302
+      # Descomente e configure se tiver servidor TURN próprio
+      # - TURN_SERVER=turn:seu-turn.com:3478
+      # - TURN_USERNAME=usuario
+      # - TURN_PASSWORD=senha
+    ports:
+      - "27015:27015/udp"
+      - "27016:27016/tcp"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - webxash-network
+
+  # Proxy reverso com TLS automático (opcional)
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - webxash-network
+    depends_on:
+      - webxash-server
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  webxash-network:
+    driver: bridge
